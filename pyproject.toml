@@ -1,0 +1,104 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "phonelink"
+license = { text = "MIT" }
+version = "0.4.0"
+description = "Comunicación PC ↔ móvil sobre TCP con TLS y autenticación por token"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Christian" }]
+keywords = ["tcp", "tls", "hmac", "zeroconf", "phonelink", "asyncio"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications",
+    "Topic :: Internet",
+    "Topic :: Security :: Cryptography",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+zeroconf = ["zeroconf>=0.130"]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+    "pytest-timeout>=2.2",
+    "mypy>=1.8",
+    "ruff>=0.5",
+    "cryptography>=42",
+    "build>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ponisio7/phonelink"
+Repository = "https://github.com/ponisio7/phonelink"
+Issues = "https://github.com/ponisio7/phonelink/issues"
+Changelog = "https://github.com/ponisio7/phonelink/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phonelink"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/phonelink/py.typed" = "phonelink/py.typed"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = [
+    "error",
+    # zeroconf opcional: avisos de deprecación de dependencias transitivas
+    "ignore::DeprecationWarning:zeroconf.*",
+    # Tests de replaced/revoked: el GC cierra el StreamWriter del "cliente
+    # viejo" tras el cierre remoto del servidor. No es una fuga real.
+    "ignore:unclosed.*StreamWriter:ResourceWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
+timeout = 30
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+files = ["src/phonelink", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["zeroconf.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PT", "SIM", "TID", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]

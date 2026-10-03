@@ -1,0 +1,8 @@
+zeroconf>=0.130
+
+[ble]
+bleak>=0.22
+
+[dev]
+pytest
+pytest-asyncio

@@ -1,0 +1,18 @@
+phonelink/
+├── pyproject.toml
+├── src/
+│   └── phonelink/
+│       ├── __init__.py
+│       ├── protocol.py
+│       ├── transport.py
+│       ├── wifi.py
+│       └── peer.py
+├── examples/
+│   ├── ejemplo_pc.py
+│   └── ejemplo_cliente.py
+├── .env/
+└── tests/
+    ├── conftest.py
+    ├── test_protocol.py
+    ├── test_wifi.py
+    └── test_peer.py
