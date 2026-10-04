@@ -1,4 +1,4 @@
-"""Framing y serialización de mensajes - v0.3 parcheado.
+"""Framing y serialización de mensajes - v0.5.1.
 
 Formato en el cable: [4 bytes big-endian con longitud N][N bytes JSON UTF-8].
 
@@ -8,6 +8,10 @@ Fixes aplicados:
 - M10: Límite de claves/estructura
 - B5: Preservar traza en IncompleteReadError
 - A6: MAX_PAYLOAD reducido a 1MB configurable
+
+v0.5: ProtocolError se mueve a exceptions.py (jerarquía unificada).
+v0.5.1: encode(obj, max_payload=) opcional (paridad Kotlin);
+        MessageStream.send con watchdog de timeout (cierra socket si drain se cuelga).
 """
 
 import asyncio
@@ -16,6 +20,8 @@ import struct
 import time
 import re
 from typing import Any, Callable, List, Optional
+
+from .exceptions import ProtocolError  # noqa: F401  (re-export)
 
 HEADER_SIZE = 4
 PROTOCOL_VERSION = 2
@@ -36,18 +42,15 @@ MAX_JSON_KEYS = 10_000  # número aproximado máximo de claves
 # Regex para detectar enteros largos fuera de strings - usado en pre-validación
 _LONG_INT_RE = re.compile(r'(?<!\\)"-?\d{100,}|(?<!")-?\d{100,}')
 
-class ProtocolError(Exception):
-    """Error de framing, serialización o validación."""
 
-
-def encode(obj: Any) -> bytes:
+def encode(obj: Any, max_payload: int = MAX_PAYLOAD) -> bytes:
     try:
         data = json.dumps(
             obj, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ProtocolError(f"Objeto no serializable: {exc}") from exc
-    if len(data) > MAX_PAYLOAD:
+    if len(data) > max_payload:
         raise ProtocolError(f"Payload demasiado grande: {len(data)} bytes")
     return struct.pack(">I", len(data)) + data
 
@@ -58,7 +61,7 @@ def _reject_json_constant(name: str) -> None:
 
 def _prevalidate_json_payload(payload: bytes) -> None:
     """Valida profundidad, enteros gigantes y tamaño de estructura antes de json.loads.
-    
+
     C4: Evita C-Stack Overflow por anidamiento profundo.
     C11: Evita DoS por enteros de 1MB de dígitos.
     M10: Evita JSON bombs por exceso de claves.
@@ -69,7 +72,7 @@ def _prevalidate_json_payload(payload: bytes) -> None:
         raise ProtocolError(f"UTF-8 inválido: {exc}") from exc
 
     # C11: búsqueda rápida de enteros muy largos
-    # Si encontramos \d{100,} fuera de contexto simple, rechazamos
+    # Si encontramos \\d{100,} fuera de contexto simple, rechazamos
     # Hacemos scan rápido sin regex costoso primero
     if len(text) > 100:
         # Escaneo manual para no contar dígitos dentro de strings
@@ -79,7 +82,7 @@ def _prevalidate_json_payload(payload: bytes) -> None:
         depth = 0
         max_depth = 0
         colon_count = 0
-        
+
         for ch in text:
             if in_string:
                 if escape:
@@ -171,10 +174,10 @@ async def read_message(
             f"Payload anunciado demasiado grande: {n} > {max_size}"
         )
     payload = await _read_exactly(reader, n, idle_timeout, on_activity)
-    
+
     # C4, C11, M10: pre-validación antes de json.loads
     _prevalidate_json_payload(payload)
-    
+
     try:
         return json.loads(
             payload.decode("utf-8"),
@@ -218,12 +221,19 @@ class MessageStream:
     def _touch(self) -> None:
         self.last_rx = time.monotonic()
 
-    async def send(self, obj: Any) -> None:
+    async def send(self, obj: Any, timeout: Optional[float] = None) -> None:
         async with self._lock:
             writer = self.writer
             writer.write(encode(obj))
         try:
-            await writer.drain()
+            if timeout is None:
+                await writer.drain()
+            else:
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            # Watchdog: cerrar socket para que la escritura bloqueada se aborte
+            await self.close()
+            raise ConnectionError("Timeout al enviar") from exc
         except OSError as exc:
             raise ConnectionError(str(exc)) from exc
 
@@ -241,3 +251,24 @@ class MessageStream:
 
     async def close(self) -> None:
         await close_quietly(self.writer)
+
+
+__all__ = [
+    "HEADER_SIZE",
+    "PROTOCOL_VERSION",
+    "MAX_PAYLOAD",
+    "HANDSHAKE_MAX",
+    "CONTROL_MAX",
+    "DEFAULT_IDLE_TIMEOUT",
+    "READ_CHUNK",
+    "NONCE_SIZE",
+    "MAX_JSON_DEPTH",
+    "MAX_INT_DIGITS",
+    "MAX_JSON_KEYS",
+    "ProtocolError",
+    "encode",
+    "read_message",
+    "write_message",
+    "close_quietly",
+    "MessageStream",
+]

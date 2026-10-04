@@ -1,4 +1,4 @@
-"""Transporte WiFi con sockets TCP, autenticación por token y zeroconf - v0.4.0.
+"""Transporte WiFi con sockets TCP, autenticación por token y zeroconf - v0.6.0.
 
 Fixes acumulados:
   v0.3: C1 host="" bypass, C2 nonce/MAC longitud, C3 DoS semáforos, C5 TLS mínimo,
@@ -16,6 +16,17 @@ Fixes acumulados:
         set_token con update_provider=True,
         _token_digest eliminado (código muerto),
         generate_token() helper exportable.
+  v0.5: TCP_NODELAY en cliente y servidor (paridad con Kotlin),
+        SO_REUSEADDR explícito en el servidor,
+        bound_port property (paridad con Kotlin boundPort),
+        excepciones movidas a exceptions.py (jerarquía PhoneLinkError).
+  v0.6: [PARIDAD POR SUMA CON KOTLIN]
+        - verify_hostname separado de allow_insecure_tls
+        - stop_timeout en WiFiServer y WiFiClient (usado en stop())
+        - ZeroconfPublisher inyectable + AsyncZeroconfPublisher default
+        - max_pending_handlers_per_event (además del global)
+        - watchdog en MessageStream.send() (vía protocol.py)
+        - Protocol.encode(obj, max_payload) opcional (vía protocol.py)
 """
 
 from __future__ import annotations
@@ -32,6 +43,7 @@ import secrets
 import socket
 import ssl
 import time
+from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -48,6 +60,13 @@ except ImportError:  # pragma: no cover
     AsyncZeroconf = None  # type: ignore[assignment]
     _HAS_ZEROCONF = False
 
+from .exceptions import (
+    AuthRejected,
+    LinkConnectionError,
+    PhoneLinkError,
+    TransientAuthError,
+)
+from .log import plog
 from .protocol import (
     DEFAULT_IDLE_TIMEOUT,
     HANDSHAKE_MAX,
@@ -69,6 +88,7 @@ MIN_TOKEN_LEN = 16
 DEFAULT_HANDSHAKE_TIMEOUT = 5.0
 DEFAULT_SEND_TIMEOUT = 15.0
 DEFAULT_REVOKE_TIMEOUT = 3.0
+DEFAULT_STOP_TIMEOUT = 2.0
 DEFAULT_CONNECT_TIMEOUT = 10.0
 DEFAULT_MAX_PREAUTH_CONNECTIONS = 32
 DEFAULT_MAX_HANDSHAKES = 8
@@ -95,23 +115,19 @@ MAX_SERVICE_NAME_LEN = 63
 
 
 # --------------------------------------------------------------------------- #
-# Excepciones
-# --------------------------------------------------------------------------- #
-class AuthRejected(ConnectionError):
-    def __init__(self, reason: str) -> None:
-        super().__init__(f"Auth rechazada: {reason}")
-        self.reason = reason
-
-
-class TransientAuthError(ConnectionError):
-    def __init__(self, reason: str) -> None:
-        super().__init__(f"Auth temporalmente rechazada: {reason}")
-        self.reason = reason
-
-
-# --------------------------------------------------------------------------- #
 # Utilidades
 # --------------------------------------------------------------------------- #
+def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
+    """Activa TCP_NODELAY en el socket subyacente (paridad con Kotlin)."""
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+
 def generate_token(nbytes: int = 32) -> str:
     """Genera un token seguro listo para usar como token de phonelink.
 
@@ -195,22 +211,10 @@ def _check_tls_context(
     *,
     host: str = "",
     allow_insecure_tls: bool = False,
+    verify_hostname: bool = True,
 ) -> None:
-    """Valida el SSLContext.
-
-    - Rechaza versiones *explícitamente* débiles (SSLv3, TLSv1.0, TLSv1.1).
-      No rechaza MINIMUM_SUPPORTED / MAXIMUM_SUPPORTED: son marcadores de
-      "deja que OpenSSL decida" y en la práctica negocian TLS 1.2+.
-    - En cliente, fuera de loopback y sin allow_insecure_tls, exige
-      verify_mode == CERT_REQUIRED y check_hostname == True.
-    - En servidor, no se puede verificar el contexto de cliente.
-    """
     if ctx is None:
         return
-
-    # 1) TLS mínimo: solo rechazar versiones explícitamente débiles.
-    #    MINIMUM_SUPPORTED (-2) < TLSv1_2 es True por accidente de enum,
-    #    pero no significa que el contexto sea débil.
     if hasattr(ctx, "minimum_version"):
         weak_versions = {
             ssl.TLSVersion.SSLv3,
@@ -219,33 +223,116 @@ def _check_tls_context(
         }
         try:
             if ctx.minimum_version in weak_versions:
-                raise ValueError(
-                    "SSLContext.minimum_version debe ser TLSv1_2 o superior"
-                )
+                raise ValueError("SSLContext.minimum_version debe ser TLSv1_2 o superior")
         except (AttributeError, TypeError):
             pass
-
-    # 2) Cliente: verificación completa fuera de loopback
-    if not is_server and not _is_loopback(host) and not allow_insecure_tls:
-        if ctx.verify_mode != ssl.CERT_REQUIRED:
+    if not is_server and not _is_loopback(host):
+        if not verify_hostname and not allow_insecure_tls:
             raise ValueError(
-                "ssl_context debe tener verify_mode=CERT_REQUIRED fuera de "
-                "loopback. Si aceptas MITM conscientemente, pasa "
-                "allow_insecure_tls=True."
+                "verify_hostname=False fuera de loopback expone el token a un MITM. "
+                "Si lo aceptas conscientemente, pasa allow_insecure_tls=True."
             )
-        if not ctx.check_hostname:
-            raise ValueError(
-                "ssl_context debe tener check_hostname=True fuera de loopback. "
-                "Si aceptas MITM conscientemente, pasa allow_insecure_tls=True."
-            )
-
-    # 3) Servidor: aviso si no hay cipher suites
+        if not allow_insecure_tls:
+            if ctx.verify_mode != ssl.CERT_REQUIRED:
+                raise ValueError(
+                    "ssl_context debe tener verify_mode=CERT_REQUIRED fuera de loopback. "
+                    "Si aceptas MITM conscientemente, pasa allow_insecure_tls=True."
+                )
+            if verify_hostname and not ctx.check_hostname:
+                raise ValueError(
+                    "ssl_context debe tener check_hostname=True fuera de loopback cuando "
+                    "verify_hostname=True. Si aceptas MITM, pasa verify_hostname=False "
+                    "+ allow_insecure_tls=True."
+                )
     if is_server:
         try:
             if not ctx.get_ciphers():
                 log.warning("SSLContext de servidor sin cipher suites configuradas")
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Zeroconf publisher (inyectable, paridad con Kotlin ZeroconfPublisher)
+# --------------------------------------------------------------------------- #
+class ZeroconfPublisher(ABC):
+    """Publicador de descubrimiento mDNS. Equivale a ZeroconfPublisher de Kotlin.
+
+    Permite inyectar implementaciones alternativas (JmDNS en desktop, mocks
+    en tests, backends custom) sin acoplar la librería a `zeroconf`.
+    """
+
+    @abstractmethod
+    async def publish(
+        self,
+        service_name: str,
+        service_type: str,
+        port: int,
+        properties: Dict[str, str],
+    ) -> None:
+        ...
+
+    @abstractmethod
+    async def unpublish(self) -> None:
+        ...
+
+
+class AsyncZeroconfPublisher(ZeroconfPublisher):
+    """Implementación por defecto basada en el paquete `zeroconf`.
+
+    Si `zeroconf` no está instalado, `publish()` no hace nada y loggea.
+    """
+
+    def __init__(self) -> None:
+        self._zeroconf: Optional["AsyncZeroconf"] = None
+        self._info: Optional["ServiceInfo"] = None
+
+    async def publish(
+        self,
+        service_name: str,
+        service_type: str,
+        port: int,
+        properties: Dict[str, str],
+    ) -> None:
+        if not _HAS_ZEROCONF:
+            log.info("zeroconf no instalado; descubrimiento mDNS deshabilitado")
+            return
+        ip = _local_ip()
+        if ip is None:
+            log.info("Sin IP de LAN utilizable; zeroconf deshabilitado")
+            return
+        try:
+            self._zeroconf = AsyncZeroconf()
+            try:
+                ip_bytes = socket.inet_aton(ip)
+            except OSError:
+                try:
+                    ip_bytes = socket.inet_pton(socket.AF_INET6, ip)
+                except OSError:
+                    log.warning("IP %s no es IPv4 ni IPv6 válida para zeroconf", ip)
+                    await self.unpublish()
+                    return
+            self._info = ServiceInfo(
+                service_type,
+                f"{service_name}.{service_type}",
+                addresses=[ip_bytes],
+                port=port,
+                properties=properties,
+            )
+            await self._zeroconf.async_register_service(self._info)
+        except Exception:
+            log.exception("No se pudo registrar el servicio zeroconf")
+            await self.unpublish()
+
+    async def unpublish(self) -> None:
+        if self._zeroconf is not None:
+            with contextlib.suppress(Exception):
+                if self._info is not None:
+                    await self._zeroconf.async_unregister_service(self._info)
+            with contextlib.suppress(Exception):
+                await self._zeroconf.async_close()
+        self._zeroconf = None
+        self._info = None
 
 
 # --------------------------------------------------------------------------- #
@@ -281,7 +368,6 @@ class _RateLimiter:
 
     def _purge_if_needed(self, now: float) -> None:
         self._purge_expired(now)
-        # Evitar evictar bloqueos activos: solo purgamos fallos no bloqueados.
         while len(self._failures) > self.max_tracked_ips:
             evicted = False
             for ip in list(self._failures.keys()):
@@ -290,8 +376,6 @@ class _RateLimiter:
                     evicted = True
                     break
             if not evicted:
-                # Todos los fallos corresponden a IPs bloqueadas activas.
-                # No evictamos para no desbloquear atacantes; solo avisamos.
                 log.warning(
                     "RateLimiter: %d fallos con todas las IPs bloqueadas; "
                     "no se evicta para no desbloquear atacantes",
@@ -353,12 +437,14 @@ class WiFiServer(Transport):
         require_strong_token: bool = True,
         rate_limit: bool = True,
         token_provider: Optional[Callable[[], str]] = None,
+        zeroconf_publisher: Optional[ZeroconfPublisher] = None,
         *,
         # [FIX v0.4] Límites configurables
         max_payload: int = MAX_PAYLOAD,
         handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
         send_timeout: float = DEFAULT_SEND_TIMEOUT,
         revoke_timeout: float = DEFAULT_REVOKE_TIMEOUT,
+        stop_timeout: float = DEFAULT_STOP_TIMEOUT,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         max_preauth_connections: int = DEFAULT_MAX_PREAUTH_CONNECTIONS,
         handshake_sem_timeout: float = DEFAULT_HANDSHAKE_SEM_TIMEOUT,
@@ -399,13 +485,19 @@ class WiFiServer(Transport):
         self.port = port
         self.service_name = service_name
         self.ssl_context = ssl_context
-        self.enable_zeroconf = enable_zeroconf and _HAS_ZEROCONF
+        self.enable_zeroconf = enable_zeroconf
+        # [v0.6] Publisher inyectable con default AsyncZeroconfPublisher
+        self.zeroconf_publisher: ZeroconfPublisher = (
+            zeroconf_publisher if zeroconf_publisher is not None
+            else AsyncZeroconfPublisher()
+        )
 
         # [FIX v0.4] Límites configurables
         self.max_payload = max_payload
         self.handshake_timeout = handshake_timeout
         self.send_timeout = send_timeout
         self.revoke_timeout = revoke_timeout
+        self.stop_timeout = stop_timeout
         self.idle_timeout = idle_timeout
         self.handshake_sem_timeout = handshake_sem_timeout
         self.preauth_sem_timeout = preauth_sem_timeout
@@ -416,8 +508,6 @@ class WiFiServer(Transport):
         self._preauth_sem = asyncio.Semaphore(max_preauth_connections)
         self._server: Optional[asyncio.AbstractServer] = None
         self._stream: Optional[MessageStream] = None
-        self._zeroconf: Optional["AsyncZeroconf"] = None
-        self._service_info: Optional["ServiceInfo"] = None
         self._lock = asyncio.Lock()
         self._closed_by_us = False
         self._rate_limiter = (
@@ -440,6 +530,20 @@ class WiFiServer(Transport):
     def last_rx_time(self) -> Optional[float]:
         stream = self._stream
         return stream.last_rx if stream is not None else None
+
+    @property
+    def bound_port(self) -> int:
+        """Puerto real tras start(). Útil con port=0 (OS elige puerto libre).
+
+        Antes de start() devuelve self.port (el solicitado).
+        Equivale a `boundPort` de phonelink-kotlin.
+        """
+        if self._server is not None:
+            try:
+                return self._server.sockets[0].getsockname()[1]
+            except (IndexError, OSError):
+                pass
+        return self.port
 
     # ------------------------------------------------------------------ #
     # Token
@@ -535,8 +639,9 @@ class WiFiServer(Transport):
                     self.handshake_timeout if self.ssl_context is not None else None
                 ),
                 backlog=64,
+                reuse_address=True,   # explícito (paridad con Kotlin s.reuseAddress = true)
             )
-            log.info("WiFiServer escuchando en %s:%d", self.host, self.port)
+            log.info("WiFiServer escuchando en %s:%d", self.host, self.bound_port)
             if self.enable_zeroconf:
                 await self._register_zeroconf()
 
@@ -546,41 +651,19 @@ class WiFiServer(Transport):
             await _start_server()
 
     async def _register_zeroconf(self) -> None:
-        if not _HAS_ZEROCONF:
-            log.info("zeroconf no instalado; descubrimiento mDNS deshabilitado")
-            return
+        """[v0.6] Usa self.zeroconf_publisher inyectable."""
         if _is_loopback(self.host):
             log.info("Servidor en loopback; zeroconf no aplica")
             return
-        ip = _local_ip()
-        if ip is None:
-            log.info("Sin IP de LAN utilizable; zeroconf deshabilitado")
-            return
         try:
-            self._zeroconf = AsyncZeroconf()
-            try:
-                ip_bytes = socket.inet_aton(ip)
-            except OSError:
-                try:
-                    ip_bytes = socket.inet_pton(socket.AF_INET6, ip)
-                except OSError:
-                    log.warning("IP %s no es IPv4 ni IPv6 válida para zeroconf", ip)
-                    return
-            self._service_info = ServiceInfo(
+            await self.zeroconf_publisher.publish(
+                self.service_name,
                 SERVICE_TYPE,
-                f"{self.service_name}.{SERVICE_TYPE}",
-                addresses=[ip_bytes],
-                port=self.port,
-                properties={"token_required": "1"},
+                self.bound_port,
+                {"token_required": "1"},
             )
-            await self._zeroconf.async_register_service(self._service_info)
         except Exception:
             log.exception("No se pudo registrar el servicio zeroconf")
-            if self._zeroconf is not None:
-                with contextlib.suppress(Exception):
-                    await self._zeroconf.async_close()
-            self._zeroconf = None
-            self._service_info = None
 
     # ------------------------------------------------------------------ #
     # Manejo de cliente
@@ -590,6 +673,8 @@ class WiFiServer(Transport):
     ) -> None:
         peer = writer.get_extra_info("peername")
         ip = peer[0] if peer else "unknown"
+        # TCP_NODELAY (paridad con Kotlin tcpNoDelay = true)
+        _set_tcp_nodelay(writer)
         stream = MessageStream(reader, writer)
         try:
             if self._rate_limiter is not None and await self._rate_limiter.is_blocked(ip):
@@ -808,17 +893,16 @@ class WiFiServer(Transport):
         async with self._lock:
             stream = self._stream
             if stream is None:
-                raise ConnectionError("No hay cliente conectado")
+                raise LinkConnectionError("No hay cliente conectado")
             try:
                 await asyncio.wait_for(stream.send(obj), timeout=self.send_timeout)
             except asyncio.TimeoutError as exc:
                 log.warning("Timeout al enviar; cerrando conexión")
-                # Mutamos bajo el mismo lock, sin llamar a disconnect()
                 self._stream = None
                 self._closed_by_us = True
                 with contextlib.suppress(Exception):
                     await stream.close()
-                raise ConnectionError("Timeout al enviar") from exc
+                raise LinkConnectionError("Timeout al enviar") from exc
 
     async def disconnect(self) -> None:
         async with self._lock:
@@ -830,6 +914,7 @@ class WiFiServer(Transport):
                 await stream.close()
 
     async def stop(self) -> None:
+        # [v0.6] Esperar revocaciones pendientes con stop_timeout como techo
         if self._revoke_tasks:
             _, still = await asyncio.wait(
                 list(self._revoke_tasks), timeout=self.revoke_timeout
@@ -837,24 +922,29 @@ class WiFiServer(Transport):
             for t in still:
                 t.cancel()
             if still:
-                await asyncio.gather(*still, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*still, return_exceptions=True),
+                        timeout=self.stop_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    pass
             self._revoke_tasks.clear()
         await self.disconnect()
         if self._server is not None:
             self._server.close()
             with contextlib.suppress(Exception):
-                await self._server.wait_closed()
+                try:
+                    await asyncio.wait_for(
+                        self._server.wait_closed(), timeout=self.stop_timeout
+                    )
+                except asyncio.TimeoutError:
+                    pass
             self._server = None
-        if self._zeroconf is not None:
+        # [v0.6] unpublish vía publisher inyectable
+        if self.enable_zeroconf:
             with contextlib.suppress(Exception):
-                if self._service_info is not None:
-                    await self._zeroconf.async_unregister_service(self._service_info)
-                else:
-                    await self._zeroconf.async_unregister_all_services()
-            with contextlib.suppress(Exception):
-                await self._zeroconf.async_close()
-            self._zeroconf = None
-            self._service_info = None
+                await self.zeroconf_publisher.unpublish()
 
 
 # --------------------------------------------------------------------------- #
@@ -874,11 +964,13 @@ class WiFiClient(Transport):
         min_stable_seconds: float = 3.0,
         on_auth_error: Optional[Callable[[str], Any]] = None,
         allow_insecure_tls: bool = False,
+        verify_hostname: bool = True,
         *,
-        # [FIX v0.4] Límites configurables
+        # [FIX v0.4] Límites configurables + [PARIDAD v0.6] stop_timeout
         max_payload: int = MAX_PAYLOAD,
         handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
         send_timeout: float = DEFAULT_SEND_TIMEOUT,
+        stop_timeout: float = DEFAULT_STOP_TIMEOUT,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         on_session_terminated: Optional[Callable[[str], Any]] = None,
     ) -> None:
@@ -888,6 +980,7 @@ class WiFiClient(Transport):
         _check_tls_context(
             ssl_context, is_server=False,
             host=host, allow_insecure_tls=allow_insecure_tls,
+            verify_hostname=verify_hostname,
         )
         if ssl_context is None and not _is_loopback(host) and not allow_insecure_lan:
             raise ValueError(
@@ -919,6 +1012,9 @@ class WiFiClient(Transport):
         self.min_stable_seconds = min_stable_seconds
         self.on_auth_error = on_auth_error
         self.on_session_terminated = on_session_terminated
+        self.verify_hostname = verify_hostname
+        self.allow_insecure_tls = allow_insecure_tls
+        self.stop_timeout = stop_timeout
 
         # [FIX v0.4] Límites configurables
         self.max_payload = max_payload
@@ -996,6 +1092,8 @@ class WiFiClient(Transport):
             ),
             timeout=self.connect_timeout,
         )
+        # TCP_NODELAY (paridad con Kotlin)
+        _set_tcp_nodelay(writer)
         return MessageStream(reader, writer)
 
     async def _call_auth_error(self, reason: str) -> None:
@@ -1163,12 +1261,9 @@ class WiFiClient(Transport):
                 if isinstance(msg, dict):
                     t = msg.get("type")
                     if t in ("replaced", "revoked"):
-                        log.warning(
-                            "Sesión terminada por el servidor: %s", t
-                        )
+                        log.warning("Sesión terminada por el servidor: %s", t)
                         self._running = False
                         self._replaced_or_revoked = True
-                        # [FIX v0.4] Notificar a la app sin marcarlo como auth_rejected
                         await self._call_session_terminated(t)
                         break
                 await self._emit_message(msg)
@@ -1190,11 +1285,10 @@ class WiFiClient(Transport):
     # Envío / desconexión / stop
     # ------------------------------------------------------------------ #
     async def send(self, obj: Any) -> None:
-        # [FIX v0.4 BLOCKER 1] Igual que en el servidor: cerrar sin re-adquirir lock.
         async with self._lock:
             stream = self._stream
             if stream is None:
-                raise ConnectionError("No conectado")
+                raise LinkConnectionError("No conectado")
             try:
                 await asyncio.wait_for(stream.send(obj), timeout=self.send_timeout)
             except asyncio.TimeoutError as exc:
@@ -1203,7 +1297,7 @@ class WiFiClient(Transport):
                 with contextlib.suppress(Exception):
                     await stream.close()
                 self._connected.clear()
-                raise ConnectionError("Timeout al enviar") from exc
+                raise LinkConnectionError("Timeout al enviar") from exc
 
     async def disconnect(self) -> None:
         async with self._lock:
@@ -1215,11 +1309,39 @@ class WiFiClient(Transport):
                 await stream.close()
 
     async def stop(self) -> None:
+        """[v0.6] Ahora respeta stop_timeout al esperar la task de reconexión."""
         self._running = False
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._task
+                try:
+                    await asyncio.wait_for(self._task, timeout=self.stop_timeout)
+                except asyncio.TimeoutError:
+                    pass
             self._task = None
         await self.disconnect()
         self._connected.clear()
+
+
+__all__ = [
+    "WiFiServer",
+    "WiFiClient",
+    "ZeroconfPublisher",
+    "AsyncZeroconfPublisher",
+    "generate_token",
+    "SERVICE_TYPE",
+    "DEFAULT_PORT",
+    "MIN_TOKEN_LEN",
+    "AUTH_FAILED",
+    "PROTOCOL_VERSION_MISMATCH",
+    "RATE_LIMITED",
+    "REVOKED",
+    "SERVER_ERROR",
+    "TERMINAL_AUTH_REASONS",
+    "TRANSIENT_AUTH_REASONS",
+    # Re-export de excepciones para compatibilidad de imports
+    "AuthRejected",
+    "TransientAuthError",
+    "LinkConnectionError",
+    "PhoneLinkError",
+]
